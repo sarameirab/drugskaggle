@@ -252,7 +252,7 @@ def predict(models: dict, df: pd.DataFrame) -> dict:
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
-def evaluate(preds) -> float:
+def evaluate(preds, df_data) -> float:
     """
     Compute the competition's Hardcore Clinical Score on a labeled validation set.
 
