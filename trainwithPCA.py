@@ -264,15 +264,15 @@ def evaluate(preds) -> float:
     Returns the final composite score (0.0 – 1.0).
     """
     # ── 1. Severity – Macro F1 ─────────────────────────────────────────────────
-    y_sev_true  = df_val["Severity"].fillna("Moderate")
+    y_sev_true  = df_data["Severity"].fillna("Moderate")
     f1_severity = f1_score(y_sev_true, preds["severity"], average="macro")
 
     # ── 2. Side Effects – Micro F1 (flattened across all columns) ─────────────
-    y_bin_true = df_val[binary_cols].fillna(0).values.astype(int)
+    y_bin_true = df_data[binary_cols].fillna(0).values.astype(int)
     f1_binary  = f1_score(y_bin_true.ravel(), preds["binary"].ravel(), average="micro")
 
     # ── 3. PRR – Masked RMSE → Inverse score ──────────────────────────────────
-    y_prr_true = df_val[prr_cols].fillna(0).values.astype(np.float32)
+    y_prr_true = df_data[prr_cols].fillna(0).values.astype(np.float32)
     mask = y_prr_true > 0
     if mask.sum() > 0:
         masked_rmse = np.sqrt(np.mean((preds["prr"][mask] - y_prr_true[mask]) ** 2))
@@ -284,7 +284,7 @@ def evaluate(preds) -> float:
     score = 0.4 * f1_severity + 0.3 * f1_binary + 0.3 * prr_score
 
     print(f"\n{'='*52}")
-    print(f"  Hardcore Clinical Score  (val n={len(df_val)})")
+    print(f"  Hardcore Clinical Score  (val n={len(df_data)})")
     print(f"{'='*52}")
     print(f"  Severity  Macro  F1  : {f1_severity:.4f}   (weight 40%)")
     print(f"  Side Eff. Micro  F1  : {f1_binary:.4f}   (weight 30%)")
@@ -298,7 +298,7 @@ def evaluate(preds) -> float:
 
 # ── Submission ─────────────────────────────────────────────────────────────────
 
-def submit(preds, out_path: str = SUBMISSION_PATH):
+def submit(preds, df_test, out_path: str = SUBMISSION_PATH):
     print("Building submission file...")
     sub = pd.DataFrame({"Pair_ID": df_test["Pair_ID"]})
     sub["Severity"] = preds["severity"]
@@ -326,14 +326,14 @@ if __name__ == "__main__":
     binary_cols = models["binary_cols"]
     prr_cols    = models["prr_cols"]
 
-    preds = predict(models, df_val)
-    evaluate(preds)
+    validation_preds = predict(models, df_val)
+    print("\nEvaluating on validation set...")
+    evaluate(validation_preds, df_val)
 
-    print(f"\nLoading test data from {TEST_PATH}...")
-    df_test = pd.read_csv(TEST_PATH)
-    print(f"  Test shape: {df_test.shape}")
-    preds = predict(models, df_test)
-
-    sub = submit(preds)
-    print("\nDone. Preview:")
-    print(sub.head())
+    # print(f"\nLoading test data from {TEST_PATH}...")
+    # df_test = pd.read_csv(TEST_PATH)
+    # print(f"  Test shape: {df_test.shape}")
+    # test_preds = predict(models, df_test)
+    # sub = submit(test_preds, df_test)
+    # print("\nDone. Preview:")
+    # print(sub.head())
