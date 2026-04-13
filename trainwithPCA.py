@@ -7,6 +7,7 @@ Updated with PCA for drastically faster training times.
 import re
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
@@ -192,12 +193,18 @@ def train(train_path: str = TRAIN_PATH):
     print("Training PRR regressor...")
     y_prr = df[prr_cols].fillna(0).values.astype(np.float32)
 
+    # Tweedie regression is designed for zero-inflated, right-skewed positive
+    # data — exactly the PRR distribution profile. Unlike MSE, it doesn't get
+    # dominated by the zero-majority and naturally handles the heavy right tail.
+    # tweedie_variance_power=1.5 sits between Poisson (1.0) and Gamma (2.0).
     prr_model = MultiOutputRegressor(
         lgb.LGBMRegressor(
+            objective="tweedie",
+            tweedie_variance_power=1.5,
             n_estimators=300,
             learning_rate=0.05,
             num_leaves=31,
-            max_depth = 5,
+            max_depth=5,
             min_child_samples=50,
             subsample=0.8,
             colsample_bytree=0.8,
@@ -219,6 +226,39 @@ def train(train_path: str = TRAIN_PATH):
         "binary_cols": binary_cols,
         "prr_cols": prr_cols,
     }
+
+def prr_zero_breakdown(preds: dict, df_data: pd.DataFrame, prr_cols: list):
+    """
+    Print a confusion-style breakdown of predicted vs true PRR zeros/non-zeros
+    across all (row, side-effect) entries.
+
+        True=0, Pred=0  → True Negative  (correctly silent)
+        True=0, Pred>0  → False Positive  (predicted a signal where none exists)
+        True>0, Pred=0  → False Negative  (missed a real signal)
+        True>0, Pred>0  → True Positive   (correctly detected a signal)
+    """
+    y_true = df_data[prr_cols].fillna(0).values.astype(np.float32)
+    y_pred = preds["prr"].astype(np.float32)
+
+    true_pos = ((y_true > 0) & (y_pred > 0)).sum()
+    true_neg = ((y_true == 0) & (y_pred == 0)).sum()
+    false_pos = ((y_true == 0) & (y_pred > 0)).sum()
+    false_neg = ((y_true > 0) & (y_pred == 0)).sum()
+    total = y_true.size
+
+    print(f"\n{'='*52}")
+    print(f"  PRR Zero / Non-Zero Breakdown  ({total:,} cells total)")
+    print(f"{'='*52}")
+    print(f"  True  Positive (true>0, pred>0) : {true_pos:>8,}  ({100*true_pos/total:5.1f}%)")
+    print(f"  True  Negative (true=0, pred=0) : {true_neg:>8,}  ({100*true_neg/total:5.1f}%)")
+    print(f"  False Positive (true=0, pred>0) : {false_pos:>8,}  ({100*false_pos/total:5.1f}%)")
+    print(f"  False Negative (true>0, pred=0) : {false_neg:>8,}  ({100*false_neg/total:5.1f}%)")
+    print(f"{'='*52}")
+    actual_pos = (y_true > 0).sum()
+    if actual_pos > 0:
+        recall = true_pos / actual_pos
+        print(f"  Signal Recall (TP / all true>0) : {recall:.3f}")
+    print(f"{'='*52}")
 
 
 # ── Prediction ────────────────────────────────────────────────────────────────
@@ -242,12 +282,93 @@ def predict(models: dict, df: pd.DataFrame) -> dict:
     )
     binary_preds = models["binary_model"].predict(X)
     prr_preds    = np.clip(models["prr_model"].predict(X), 0, None)
+    # Zero-gate: if the binary model says a side effect doesn't occur, its PRR
+    # must be 0. Tweedie never outputs exactly 0, so without this every cell
+    # would be non-zero regardless of whether there's a real signal.
+    prr_preds[binary_preds == 0] = 0.0
 
     return {
         "severity": severity_preds,
         "binary":   binary_preds,
         "prr":      prr_preds,
     }
+
+
+# ── PRR Visualisation ─────────────────────────────────────────────────────────
+
+def visualize_prr(preds: dict, df_data: pd.DataFrame, prr_cols: list, out_path: str = "prr_analysis.png"):
+    """
+    Four-panel diagnostic plot for PRR predictions vs ground truth.
+
+      1. Distribution of all true PRR values (non-zero only)
+      2. Predicted vs True scatter on masked (non-zero truth) entries
+      3. Per-side-effect RMSE bar chart (top 20 worst)
+      4. Residual distribution (pred - true) on masked entries
+    """
+    y_true = df_data[prr_cols].fillna(0).values.astype(np.float32)
+    y_pred = preds["prr"].astype(np.float32)
+    mask   = y_true > 0
+
+    true_masked = y_true[mask]
+    pred_masked = y_pred[mask]
+    residuals   = pred_masked - true_masked
+
+    # Per-column RMSE (only over masked entries in each column)
+    per_col_rmse = []
+    for i, col in enumerate(prr_cols):
+        col_mask = y_true[:, i] > 0
+        if col_mask.sum() > 0:
+            rmse = np.sqrt(np.mean((y_pred[:, i][col_mask] - y_true[:, i][col_mask]) ** 2))
+        else:
+            rmse = 0.0
+        per_col_rmse.append((col.replace("Target_PRR_", ""), rmse))
+    per_col_rmse.sort(key=lambda x: x[1], reverse=True)
+    top20_labels, top20_rmse = zip(*per_col_rmse)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("PRR Prediction Analysis", fontsize=14, fontweight="bold")
+
+    # 1. Distribution of true PRR (non-zero)
+    ax = axes[0, 0]
+    ax.hist(true_masked, bins=60, color="steelblue", edgecolor="white", linewidth=0.4)
+    ax.set_title("True PRR Distribution (non-zero entries)")
+    ax.set_xlabel("True PRR")
+    ax.set_ylabel("Count")
+    ax.axvline(np.median(true_masked), color="tomato", linestyle="--", label=f"Median {np.median(true_masked):.2f}")
+    ax.legend()
+
+    # 2. Predicted vs True scatter
+    ax = axes[0, 1]
+    ax.scatter(true_masked, pred_masked, alpha=0.3, s=8, color="steelblue")
+    lim = max(true_masked.max(), pred_masked.max())
+    ax.plot([0, lim], [0, lim], color="tomato", linestyle="--", linewidth=1, label="Perfect")
+    ax.set_title("Predicted vs True PRR (non-zero entries)")
+    ax.set_xlabel("True PRR")
+    ax.set_ylabel("Predicted PRR")
+    ax.legend()
+
+    # 3. Per-side-effect RMSE (top 20 worst)
+    ax = axes[1, 0]
+    ax.barh(range(len(top20_rmse)), top20_rmse[::-1], color="steelblue")
+    ax.set_yticks(range(len(top20_rmse)))
+    ax.set_yticklabels(top20_labels[::-1], fontsize=8)
+    ax.set_title("Top 20 Side Effects by PRR RMSE")
+    ax.set_xlabel("RMSE")
+
+    # 4. Residual distribution
+    ax = axes[1, 1]
+    ax.hist(residuals, bins=60, color="steelblue", edgecolor="white", linewidth=0.4)
+    ax.axvline(0, color="tomato", linestyle="--", linewidth=1, label="Zero error")
+    ax.axvline(np.mean(residuals), color="orange", linestyle="--", linewidth=1, label=f"Mean {np.mean(residuals):.2f}")
+    ax.set_title("Residuals (Predicted - True) on non-zero entries")
+    ax.set_xlabel("Residual")
+    ax.set_ylabel("Count")
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"PRR analysis plot saved to: {out_path}")
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -329,6 +450,8 @@ if __name__ == "__main__":
     validation_preds = predict(models, df_val)
     print("\nEvaluating on validation set...")
     evaluate(validation_preds, df_val)
+    visualize_prr(validation_preds, df_val, prr_cols)
+    prr_zero_breakdown(validation_preds, df_val, prr_cols)
 
     # print(f"\nLoading test data from {TEST_PATH}...")
     # df_test = pd.read_csv(TEST_PATH)
