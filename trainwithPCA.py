@@ -13,9 +13,13 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.decomposition import PCA  # <-- Added PCA import
 from sklearn.metrics import classification_report, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.base import clone
+from joblib import Parallel, delayed
 import lightgbm as lgb
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem import rdFingerprintGenerator
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -35,12 +39,16 @@ TFIDF_MAX_FEATURES = 150  # per field pair
 
 # ── Feature Engineering ────────────────────────────────────────────────────────
 
-def morgan_fingerprint(smiles: str, n_bits: int = MORGAN_BITS) -> np.ndarray:
+morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=MORGAN_BITS)
+
+def morgan_fingerprint(smiles: str) -> np.ndarray:
     """Convert a SMILES string to a Morgan (ECFP4) fingerprint vector."""
     mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) and smiles.strip() else None
     if mol is None:
-        return np.zeros(n_bits, dtype=np.float32)
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
+        return np.zeros(MORGAN_BITS, dtype=np.float32)
+    
+    # Use the generator to get the fingerprint
+    fp = morgan_gen.GetFingerprint(mol)
     return np.array(fp, dtype=np.float32)
 
 
@@ -128,79 +136,113 @@ def get_target_columns(df: pd.DataFrame):
 
 # ── Training ───────────────────────────────────────────────────────────────────
 
-def train(train_path: str = TRAIN_PATH):
-    print("Loading training data...")
-    df = pd.read_csv(train_path)
+def prepare_features(df: pd.DataFrame, tfidf_vecs=None, pca=None, fit: bool = True):
+    """
+    Build features and apply PCA.
+    If fit=True, fits tfidf_vecs and pca from df and returns them.
+    If fit=False, transforms df using the provided tfidf_vecs and pca.
+    Returns (X, tfidf_vecs, pca).
+    """
+    X, tfidf_vecs = build_features(df, tfidf_vectorizers=tfidf_vecs, fit=fit)
+    if fit:
+        print("\nApplying PCA...")
+        pca = PCA(n_components=0.99)
+        X = pca.fit_transform(X)
+    else:
+        X = pca.transform(X)
+    print(f"  Feature matrix shape after PCA: {X.shape}")
+    return X, tfidf_vecs, pca
 
-    # Note: I have commented this out so it trains on your full 15,000 row dataset.
-    # df = df.sample(frac=0.01, random_state=42) 
-    print(f"  Train shape: {df.shape}")
 
-    binary_cols, prr_cols = get_target_columns(df)
-
-    print("\nBuilding features...")
-    X_train, tfidf_vecs = build_features(df, fit=True)
-
-    # ========== PCA DIMENSIONALITY REDUCTION ==========
-    print("\nApplying PCA to reduce dimensions (this will speed up LightGBM significantly)...")
-    pca = PCA(n_components=500, random_state=42)
-    X_train = pca.fit_transform(X_train)
-    print(f"  New feature matrix shape after PCA: {X_train.shape}")
-    # ==================================================
-
-    # ── Target 1: Severity (multi-class classification) ────────────────────────
+def train_severity(X_train: np.ndarray, df: pd.DataFrame):
+    """Train the severity classifier. Returns (model, label_encoder)."""
     print("\nTraining Severity classifier...")
     le = LabelEncoder()
     y_severity = le.fit_transform(df["Severity"].fillna("Moderate"))
-
-    severity_model = lgb.LGBMClassifier(
+    model = lgb.LGBMClassifier(
         n_estimators=500,
         learning_rate=0.05,
         num_leaves=63,
-        max_depth = 5,
+        max_depth=5,
         min_child_samples=50,
         subsample=0.8,
         colsample_bytree=0.8,
         n_jobs=-1,
         verbose=1,
     )
-    severity_model.fit(X_train, y_severity)
-    train_preds = severity_model.predict(X_train)
-    print(classification_report(y_severity, train_preds, target_names=le.classes_))
+    model.fit(X_train, y_severity)
+    print(classification_report(y_severity, model.predict(X_train), target_names=le.classes_))
+    return model, le
 
-    # ── Target 2: Binary side effects (multi-label classification) ─────────────
-    print("Training Binary side-effect classifier...")
+
+def _fit_binary_estimator(base_clf, X_tr, y_tr_col, X_es, y_es_col):
+    """Fit one LGBMClassifier with early stopping. Module-level for joblib pickling."""
+    clf = clone(base_clf)
+    clf.fit(
+        X_tr, y_tr_col,
+        eval_set=[(X_es, y_es_col)],
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+    )
+    return clf
+
+
+def train_binary(X_train: np.ndarray, df: pd.DataFrame, binary_cols: list, es_frac: float = 0.15):
+    """
+    Train the binary side-effect classifier with early stopping.
+
+    Splits X_train into a fitting set and an internal early-stopping validation
+    set (es_frac of rows). This is a second validation set — separate from the
+    outer df_val used for final evaluation in __main__.
+    Returns a fitted MultiOutputClassifier.
+    """
+    print("\nTraining Binary side-effect classifier...")
     y_binary = df[binary_cols].fillna(0).values.astype(int)
 
-    binary_model = MultiOutputClassifier(
-        lgb.LGBMClassifier(
-            n_estimators=100,
-            learning_rate=0.05,
-            num_leaves=31,
-            max_depth = 5,
-            min_child_samples=50,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            n_jobs=1,
-            verbose=1,
-        ),
-        n_jobs=-1,
+    # Internal early-stopping split (distinct from the outer evaluation df_val)
+    X_tr, X_es, y_tr, y_es = train_test_split(
+        X_train, y_binary, test_size=es_frac, random_state=42
     )
-    binary_model.fit(X_train, y_binary)
+    print(f"  Early-stopping split: {X_tr.shape[0]} fit rows / {X_es.shape[0]} early-stop rows")
+
+    base_clf = lgb.LGBMClassifier(
+        n_estimators=500,  # upper bound; early stopping will select the right number
+        scale_pos_weight=2,  # heavily weight positive class to combat extreme imbalance
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=5,
+        min_child_samples=50,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_jobs=1,
+        verbose=-1,
+    )
+
+    estimators = Parallel(n_jobs=20)(
+        delayed(_fit_binary_estimator)(base_clf, X_tr, y_tr[:, i], X_es, y_es[:, i])
+        for i in range(len(binary_cols))
+    )
+
+    # Reconstruct a MultiOutputClassifier with the manually fitted estimators
+    # so the rest of the pipeline (predict, binary_zero_breakdown) is unchanged.
+    model = MultiOutputClassifier(base_clf, n_jobs=20)
+    model.estimators_ = estimators
+    model.classes_ = [clf.classes_ for clf in estimators]
+    model.n_outputs_ = len(binary_cols)
+
     print(f"  Binary model trained on {len(binary_cols)} side effects.")
+    return model
 
-    # ── Target 3: PRR regression (multi-output) ────────────────────────────────
-    print("Training PRR regressor...")
+
+def train_prr(X_train: np.ndarray, df: pd.DataFrame, prr_cols: list):
+    """Train the PRR regressor. Returns model."""
+    print("\nTraining PRR regressor...")
     y_prr = df[prr_cols].fillna(0).values.astype(np.float32)
-
     # Tweedie regression is designed for zero-inflated, right-skewed positive
     # data — exactly the PRR distribution profile. Unlike MSE, it doesn't get
     # dominated by the zero-majority and naturally handles the heavy right tail.
     # tweedie_variance_power=1.5 sits between Poisson (1.0) and Gamma (2.0).
-    prr_model = MultiOutputRegressor(
+    model = MultiOutputRegressor(
         lgb.LGBMRegressor(
-            objective="tweedie",
-            tweedie_variance_power=1.5,
             n_estimators=300,
             learning_rate=0.05,
             num_leaves=31,
@@ -213,19 +255,93 @@ def train(train_path: str = TRAIN_PATH):
         ),
         n_jobs=-1,
     )
-    prr_model.fit(X_train, y_prr)
+    model.fit(X_train, y_prr)
     print(f"  PRR model trained on {len(prr_cols)} targets.")
+    return model
+
+
+def train_all(train_path: str = TRAIN_PATH) -> dict:
+    """Train all three models end-to-end. Returns the full models dict."""
+    print("Loading training data...")
+    df = pd.read_csv(train_path)
+    print(f"  Train shape: {df.shape}")
+
+    binary_cols, prr_cols = get_target_columns(df)
+
+    print("\nBuilding features...")
+    X_train, tfidf_vecs, pca = prepare_features(df, fit=True)
+
+    severity_model, le = train_severity(X_train, df)
+    binary_model       = train_binary(X_train, df, binary_cols)
+    prr_model          = train_prr(X_train, df, prr_cols)
 
     return {
         "severity_model": severity_model,
-        "binary_model": binary_model,
-        "prr_model": prr_model,
-        "label_encoder": le,
-        "tfidf_vecs": tfidf_vecs,
-        "pca": pca,               # <-- Added PCA to the returned dictionary
-        "binary_cols": binary_cols,
-        "prr_cols": prr_cols,
+        "binary_model":   binary_model,
+        "prr_model":      prr_model,
+        "label_encoder":  le,
+        "tfidf_vecs":     tfidf_vecs,
+        "pca":            pca,
+        "binary_cols":    binary_cols,
+        "prr_cols":       prr_cols,
     }
+
+def binary_zero_breakdown(binary_preds: np.ndarray, df_data: pd.DataFrame, binary_cols: list):
+    """
+    Confusion-style breakdown of the binary side-effect classifier,
+    both in aggregate and per side effect (sorted by Recall ascending).
+    """
+    y_true = df_data[binary_cols].fillna(0).values.astype(int)
+    y_pred = binary_preds.astype(int)
+
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    total = y_true.size
+
+    print(f"\n{'='*52}")
+    print(f"  Binary Classifier Breakdown  ({total:,} cells total)")
+    print(f"{'='*52}")
+    print(f"  True  Positive (true=1, pred=1) : {tp:>8,}  ({100*tp/total:5.1f}%)")
+    print(f"  True  Negative (true=0, pred=0) : {tn:>8,}  ({100*tn/total:5.1f}%)")
+    print(f"  False Positive (true=0, pred=1) : {fp:>8,}  ({100*fp/total:5.1f}%)")
+    print(f"  False Negative (true=1, pred=0) : {fn:>8,}  ({100*fn/total:5.1f}%)")
+    print(f"{'='*52}")
+    actual_pos = tp + fn
+    if actual_pos > 0:
+        print(f"  Recall  (TP / all true=1)       : {tp/actual_pos:.3f}")
+    if (tp + fp) > 0:
+        print(f"  Precision (TP / all pred=1)     : {tp/(tp+fp):.3f}")
+    print(f"{'='*52}")
+
+    rows = []
+    for i, col in enumerate(binary_cols):
+        t = y_true[:, i]
+        p = y_pred[:, i]
+        c_tp = int(((t == 1) & (p == 1)).sum())
+        c_tn = int(((t == 0) & (p == 0)).sum())
+        c_fp = int(((t == 0) & (p == 1)).sum())
+        c_fn = int(((t == 1) & (p == 0)).sum())
+        n_pos = c_tp + c_fn
+        recall    = c_tp / n_pos       if n_pos > 0          else float("nan")
+        precision = c_tp / (c_tp+c_fp) if (c_tp + c_fp) > 0 else float("nan")
+        rows.append({
+            "Side Effect": col.replace("Target_Binary_", ""),
+            "TP": c_tp, "TN": c_tn, "FP": c_fp, "FN": c_fn,
+            "True Positives": n_pos,
+            "Recall":         round(recall, 3),
+            "Precision":      round(precision, 3),
+        })
+
+    per_effect = (
+        pd.DataFrame(rows)
+        .sort_values("Recall")
+        .reset_index(drop=True)
+    )
+    print("\nPer-side-effect breakdown (sorted by Recall ascending):")
+    print(per_effect.to_string(index=False))
+
 
 def prr_zero_breakdown(preds: dict, df_data: pd.DataFrame, prr_cols: list):
     """
@@ -259,6 +375,32 @@ def prr_zero_breakdown(preds: dict, df_data: pd.DataFrame, prr_cols: list):
         recall = true_pos / actual_pos
         print(f"  Signal Recall (TP / all true>0) : {recall:.3f}")
     print(f"{'='*52}")
+
+    # ── Per-side-effect breakdown ──────────────────────────────────────────────
+    rows = []
+    for i, col in enumerate(prr_cols):
+        t = y_true[:, i]
+        p = y_pred[:, i]
+        tp = int(((t > 0) & (p > 0)).sum())
+        tn = int(((t == 0) & (p == 0)).sum())
+        fp = int(((t == 0) & (p > 0)).sum())
+        fn = int(((t > 0) & (p == 0)).sum())
+        n_pos = tp + fn
+        recall = tp / n_pos if n_pos > 0 else float("nan")
+        rows.append({
+            "Side Effect":    col.replace("Target_PRR_", ""),
+            "TP":  tp, "TN": tn, "FP": fp, "FN": fn,
+            "True Positives": n_pos,
+            "Recall":         round(recall, 3),
+        })
+
+    per_effect = (
+        pd.DataFrame(rows)
+        .sort_values("Recall")
+        .reset_index(drop=True)
+    )
+    print("\nPer-side-effect breakdown (sorted by Recall ascending):")
+    print(per_effect.to_string(index=False))
 
 
 # ── Prediction ────────────────────────────────────────────────────────────────
@@ -419,7 +561,7 @@ def evaluate(preds, df_data) -> float:
 
 # ── Submission ─────────────────────────────────────────────────────────────────
 
-def submit(preds, df_test, out_path: str = SUBMISSION_PATH):
+def submit(models, preds, df_test, out_path: str = SUBMISSION_PATH):
     print("Building submission file...")
     sub = pd.DataFrame({"Pair_ID": df_test["Pair_ID"]})
     sub["Severity"] = preds["severity"]
@@ -438,25 +580,74 @@ def submit(preds, df_test, out_path: str = SUBMISSION_PATH):
 
 if __name__ == "__main__":
     # Hold out 15 % of train for evaluation so the score reflects unseen data.
-    df_full = pd.read_csv(TRAIN_PATH)
-    df_val   = df_full.sample(frac=0.15, random_state=42)
-    df_train = df_full.drop(df_val.index)
-    df_train.to_csv(f"{DATA_DIR}/_train_split.csv", index=False)
+    # df_full = pd.read_csv(TRAIN_PATH)
+    # df_val   = df_full.sample(frac=0.15, random_state=42)
+    # df_train = df_full.drop(df_val.index)
+    # df_train.to_csv(f"{DATA_DIR}/_train_split.csv", index=False)
 
-    models = train(f"{DATA_DIR}/_train_split.csv")
-    binary_cols = models["binary_cols"]
-    prr_cols    = models["prr_cols"]
+    # models = train_all(f"{DATA_DIR}/_train_split.csv")
+    # binary_cols = models["binary_cols"]
+    # prr_cols    = models["prr_cols"]
 
-    validation_preds = predict(models, df_val)
-    print("\nEvaluating on validation set...")
-    evaluate(validation_preds, df_val)
-    visualize_prr(validation_preds, df_val, prr_cols)
-    prr_zero_breakdown(validation_preds, df_val, prr_cols)
+    # validation_preds = predict(models, df_val)
+    # print("\nEvaluating on validation set...")
+    # evaluate(validation_preds, df_val)
+    # visualize_prr(validation_preds, df_val, prr_cols)
+    # prr_zero_breakdown(validation_preds, df_val, prr_cols)
 
     # print(f"\nLoading test data from {TEST_PATH}...")
     # df_test = pd.read_csv(TEST_PATH)
     # print(f"  Test shape: {df_test.shape}")
     # test_preds = predict(models, df_test)
-    # sub = submit(test_preds, df_test)
+    # sub = submit(models, test_preds, df_test)
     # print("\nDone. Preview:")
     # print(sub.head())
+
+    # ── PRR-only mode ─────────────────────────────────────────────────────────
+    print("Loading data...")
+    df_full  = pd.read_csv(TRAIN_PATH)
+    df_val   = df_full.sample(frac=0.15, random_state=42)
+    df_train = df_full.drop(df_val.index)
+    binary_cols, prr_cols = get_target_columns(df_full)
+
+    print("\nBuilding features...")
+    X_train, tfidf_vecs, pca = prepare_features(df_train, fit=True)
+    X_val, _, _              = prepare_features(df_val, tfidf_vecs=tfidf_vecs, pca=pca, fit=False)
+
+    # Train binary on all rows — used for zero-gating at inference.
+    binary_model = train_binary(X_train, df_train, binary_cols)
+    print("\nPredicting PRR on validation set...")
+    binary_preds = binary_model.predict(X_val)
+    print("\nZero breakdown on validation set...")
+    binary_zero_breakdown(binary_preds, df_val, binary_cols)
+    print("\nPredicting PRR on training set...")
+    binary_preds_training = binary_model.predict(X_train)
+    print("\nZero breakdown on training set...")
+    binary_zero_breakdown(binary_preds_training, df_train, binary_cols)
+
+
+
+
+
+    # Train PRR only on rows where at least one side effect is non-zero.
+    # This aligns the training distribution with the masked RMSE metric, which
+    # only scores non-zero entries. The binary model handles the zero/non-zero
+    # decision at inference; the PRR model only needs to learn magnitudes.
+    # y_prr_train  = df_train[prr_cols].fillna(0).values.astype(np.float32)
+    # active_rows  = (y_prr_train > 0).any(axis=1)
+    # print(f"\n  PRR training on {active_rows.sum()} active rows (of {len(df_train)} total)")
+    # prr_model = train_prr(X_train[active_rows], df_train.iloc[active_rows], prr_cols)
+
+
+    # prr_preds    = np.clip(prr_model.predict(X_val), 0, None)
+    # prr_preds[binary_preds == 0] = 0.0
+    # preds = {"prr": prr_preds}
+
+    # visualize_prr(preds, df_val, prr_cols)
+    # prr_zero_breakdown(binary_preds, df_val, prr_cols)
+
+    # y_prr_true  = df_val[prr_cols].fillna(0).values.astype(np.float32)
+    # mask        = y_prr_true > 0
+    # masked_rmse = np.sqrt(np.mean((prr_preds[mask] - y_prr_true[mask]) ** 2))
+    # print(f"\n  PRR Masked RMSE      : {masked_rmse:.4f}")
+    # print(f"  PRR Score 1/(1+RMSE) : {1/(1+masked_rmse):.4f}")
