@@ -150,6 +150,9 @@ def prepare_features(df: pd.DataFrame, tfidf_vecs=None, pca=None, fit: bool = Tr
         X = pca.fit_transform(X)
     else:
         X = pca.transform(X)
+    # Wrap in a DataFrame so feature names are consistent between fit and predict,
+    # avoiding the sklearn "X does not have valid feature names" warning.
+    X = pd.DataFrame(X, columns=[f"pc_{i}" for i in range(X.shape[1])])
     print(f"  Feature matrix shape after PCA: {X.shape}")
     return X, tfidf_vecs, pca
 
