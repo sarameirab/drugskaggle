@@ -13,13 +13,17 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.decomposition import PCA  # <-- Added PCA import
 from sklearn.metrics import classification_report, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
 from sklearn.base import clone
 from joblib import Parallel, delayed
 import lightgbm as lgb
+from binary_ensemble import BinaryEnsemble, get_pos_proba
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdFingerprintGenerator
+import DrugInteractionLGBMClassifier
+import DrugInteractionRandomForestClassifier
+from utils import binary_zero_breakdown
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -28,6 +32,9 @@ DATA_DIR = "data"
 TRAIN_PATH = f"{DATA_DIR}/train.csv"
 TEST_PATH = f"{DATA_DIR}/test.csv"
 SUBMISSION_PATH = f"{DATA_DIR}/submission.csv"
+RANDOM_FOREST_CLASSIFIER_THRESHOLD = 0.402  # From precision-recall curve analysis on the validation set (see plot_pr_threshold.png)
+LGBM_CLASSIFIER_THRESHOLD = 0.349  # From precision-recall curve analysis on the validation set (see plot_pr_threshold.png)
+ENSEMBLE_CLASSIFIER_THRESHOLD = 0.375  # From precision-recall curve analysis on averaged ensemble probabilities (see plot_pr_threshold.png)
 
 TEXT_COLS = [
     "Mechanism", "Pharmacodynamics", "Metabolism",
@@ -189,27 +196,28 @@ def _fit_binary_estimator(base_clf, X_tr, y_tr_col, X_es, y_es_col):
     return clf
 
 
-def train_binary(X_train: np.ndarray, df: pd.DataFrame, binary_cols: list, es_frac: float = 0.15):
-    """
-    Train the binary side-effect classifier with early stopping.
+def _fit_binary_estimator_fixed(base_clf, X_tr, y_tr_col):
+    """Fit one LGBMClassifier with a fixed n_estimators (no early stopping). Module-level for joblib pickling."""
+    clf = clone(base_clf)
+    clf.fit(X_tr, y_tr_col)
+    return clf
 
-    Splits X_train into a fitting set and an internal early-stopping validation
-    set (es_frac of rows). This is a second validation set — separate from the
-    outer df_val used for final evaluation in __main__.
+
+def train_binary_lgbm(X_train, df: pd.DataFrame, binary_cols: list, n_splits: int = 5):
+    """
+    Train the binary side-effect classifier using n_splits-fold cross-validation.
+
+    Each fold uses its validation split for early stopping and OOF evaluation.
+    The average best iteration across folds determines n_estimators for the
+    final model, which is then retrained on all data without early stopping.
     Returns a fitted MultiOutputClassifier.
     """
-    print("\nTraining Binary side-effect classifier...")
+    print(f"\nTraining Binary side-effect classifier ({n_splits}-fold CV)...")
     y_binary = df[binary_cols].fillna(0).values.astype(int)
 
-    # Internal early-stopping split (distinct from the outer evaluation df_val)
-    X_tr, X_es, y_tr, y_es = train_test_split(
-        X_train, y_binary, test_size=es_frac, random_state=42
-    )
-    print(f"  Early-stopping split: {X_tr.shape[0]} fit rows / {X_es.shape[0]} early-stop rows")
-
     base_clf = lgb.LGBMClassifier(
-        n_estimators=500,  # upper bound; early stopping will select the right number
-        scale_pos_weight=2,  # heavily weight positive class to combat extreme imbalance
+        n_estimators=500,  # upper bound; early stopping selects the right number per fold
+        scale_pos_weight=2,
         learning_rate=0.05,
         num_leaves=31,
         max_depth=5,
@@ -220,20 +228,149 @@ def train_binary(X_train: np.ndarray, df: pd.DataFrame, binary_cols: list, es_fr
         verbose=-1,
     )
 
-    estimators = Parallel(n_jobs=20)(
-        delayed(_fit_binary_estimator)(base_clf, X_tr, y_tr[:, i], X_es, y_es[:, i])
-        for i in range(len(binary_cols))
+    if n_splits != 0:
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        oof_preds = np.zeros_like(y_binary)
+        fold_f1s = []
+        best_iterations = []
+
+        for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train)):
+            print(f"\n  Fold {fold + 1}/{n_splits}  ({len(tr_idx)} train / {len(val_idx)} val rows)")
+            X_tr  = X_train.iloc[tr_idx]  if hasattr(X_train, "iloc") else X_train[tr_idx]
+            X_val = X_train.iloc[val_idx] if hasattr(X_train, "iloc") else X_train[val_idx]
+            y_tr, y_val = y_binary[tr_idx], y_binary[val_idx]
+
+            estimators = Parallel(n_jobs=20)(
+                delayed(_fit_binary_estimator)(base_clf, X_tr, y_tr[:, i], X_val, y_val[:, i])
+                for i in range(len(binary_cols))
+            )
+
+            fold_preds = np.column_stack([clf.predict(X_val) for clf in estimators])
+            oof_preds[val_idx] = fold_preds
+
+            fold_f1 = f1_score(y_val.ravel(), fold_preds.ravel(), average="micro")
+            fold_f1s.append(fold_f1)
+
+            avg_iter = int(np.mean([
+                clf.best_iteration_ for clf in estimators
+                if getattr(clf, "best_iteration_", None) is not None
+            ] or [500]))
+            best_iterations.append(avg_iter)
+            print(f"  Fold {fold + 1} micro-F1: {fold_f1:.4f}  avg best_iter: {avg_iter}")
+
+        overall_f1 = f1_score(y_binary.ravel(), oof_preds.ravel(), average="micro")
+        final_n_estimators = int(np.mean(best_iterations))
+        print(f"\n  OOF micro-F1 : {overall_f1:.4f}")
+        print(f"  Per-fold F1  : {[f'{f:.4f}' for f in fold_f1s]}")
+        print(f"  Final n_estimators (mean best_iter across folds): {final_n_estimators}")
+
+            # Retrain on all data with fixed n_estimators — no ES split needed.
+        print("\n  Training final model on all data...")
+        final_clf = lgb.LGBMClassifier(
+            n_estimators=final_n_estimators,
+            scale_pos_weight=2,
+            learning_rate=0.05,
+            num_leaves=31,
+            max_depth=5,
+            min_child_samples=50,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            n_jobs=1,
+            verbose=-1,
+        )
+
+        estimators = Parallel(n_jobs=20)(
+            delayed(_fit_binary_estimator_fixed)(final_clf, X_train, y_binary[:, i])
+            for i in range(len(binary_cols))
+        )
+
+        model = MultiOutputClassifier(final_clf, n_jobs=20)
+        model.estimators_ = estimators
+        model.classes_ = [clf.classes_ for clf in estimators]
+        model.n_outputs_ = len(binary_cols)
+
+        print(f"  Binary model trained on {len(binary_cols)} side effects.")
+    else:
+        model = MultiOutputClassifier(base_clf, n_jobs=-1)
+        model.fit(X_train, y_binary)
+
+        print(f"  Binary RF model trained on {len(binary_cols)} side effects.")
+
+    return model
+
+
+def train_binary_random_forest(X_train, df: pd.DataFrame, binary_cols: list, n_splits: int = 5):
+    """
+    Train the binary side-effect classifier using a Random Forest with n_splits-fold CV.
+
+    Each fold reports OOF micro-F1. A final model is retrained on all data
+    after CV. Returns a fitted MultiOutputClassifier.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+
+    print(f"\nTraining Binary side-effect classifier (Random Forest, {n_splits}-fold CV)...")
+    y_binary = df[binary_cols].fillna(0).values.astype(int)
+
+    base_clf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=15,
+        min_samples_split=10,
+        min_samples_leaf=10,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        n_jobs=20,
+        random_state=42,
     )
 
-    # Reconstruct a MultiOutputClassifier with the manually fitted estimators
-    # so the rest of the pipeline (predict, binary_zero_breakdown) is unchanged.
-    model = MultiOutputClassifier(base_clf, n_jobs=20)
-    model.estimators_ = estimators
-    model.classes_ = [clf.classes_ for clf in estimators]
-    model.n_outputs_ = len(binary_cols)
+    if n_splits != 0:
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        oof_preds = np.zeros_like(y_binary)
+        fold_f1s = []
 
-    print(f"  Binary model trained on {len(binary_cols)} side effects.")
+        for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train)):
+            print(f"\n  Fold {fold + 1}/{n_splits}  ({len(tr_idx)} train / {len(val_idx)} val rows)")
+            X_tr  = X_train.iloc[tr_idx]  if hasattr(X_train, "iloc") else X_train[tr_idx]
+            X_val = X_train.iloc[val_idx] if hasattr(X_train, "iloc") else X_train[val_idx]
+            y_tr, y_val = y_binary[tr_idx], y_binary[val_idx]
+
+            fold_model = MultiOutputClassifier(clone(base_clf), n_jobs=-1)
+            fold_model.fit(X_tr, y_tr)
+
+            fold_preds = fold_model.predict(X_val)
+            oof_preds[val_idx] = fold_preds
+
+            fold_f1 = f1_score(y_val.ravel(), fold_preds.ravel(), average="micro")
+            fold_f1s.append(fold_f1)
+            print(f"  Fold {fold + 1} micro-F1: {fold_f1:.4f}")
+
+        overall_f1 = f1_score(y_binary.ravel(), oof_preds.ravel(), average="micro")
+        print(f"\n  OOF micro-F1 : {overall_f1:.4f}")
+        print(f"  Per-fold F1  : {[f'{f:.4f}' for f in fold_f1s]}")
+
+        print("\n  Training final model on all data...")
+    model = MultiOutputClassifier(base_clf, n_jobs=-1)
+    model.fit(X_train, y_binary)
+
+    print(f"  Binary RF model trained on {len(binary_cols)} side effects.")
     return model
+
+
+
+def train_binary_ensemble(X_train, df: pd.DataFrame, binary_cols: list, n_splits: int = 5) -> BinaryEnsemble:
+    """
+    Train an ensemble of the LGBM and Random Forest binary classifiers.
+    Both models run their full n_splits-fold CV before the final refit.
+    Each model predicts with its own tuned threshold; majority vote combines them.
+    Returns a BinaryEnsemble.
+    """
+    lgbm_model = train_binary_lgbm(X_train, df, binary_cols, n_splits=n_splits)
+    rf_model   = train_binary_random_forest(X_train, df, binary_cols, n_splits=n_splits)
+    ensemble   = BinaryEnsemble(
+        models=[lgbm_model, rf_model],
+        threshold=ENSEMBLE_CLASSIFIER_THRESHOLD,
+    )
+    print(f"\n  Ensemble: LGBM + RF, averaged probabilities thresholded at {ENSEMBLE_CLASSIFIER_THRESHOLD}")
+    return ensemble
 
 
 def train_prr(X_train: np.ndarray, df: pd.DataFrame, prr_cols: list):
@@ -289,34 +426,13 @@ def train_all(train_path: str = TRAIN_PATH) -> dict:
         "prr_cols":       prr_cols,
     }
 
-def binary_zero_breakdown(binary_preds: np.ndarray, df_data: pd.DataFrame, binary_cols: list):
+def per_side_effect_zero_breakdown(df: pd.DataFrame, binary_cols: list, prr_cols: list):
     """
-    Confusion-style breakdown of the binary side-effect classifier,
-    both in aggregate and per side effect (sorted by Recall ascending).
+    For each side effect, print the count of true zeros in both the binary and PRR targets.
+    This helps identify which side effects are most affected by zero-inflation and may benefit from zero-gating.
     """
-    y_true = df_data[binary_cols].fillna(0).values.astype(int)
+    y_true = df[binary_cols].fillna(0).values.astype(int)
     y_pred = binary_preds.astype(int)
-
-    tp = int(((y_true == 1) & (y_pred == 1)).sum())
-    tn = int(((y_true == 0) & (y_pred == 0)).sum())
-    fp = int(((y_true == 0) & (y_pred == 1)).sum())
-    fn = int(((y_true == 1) & (y_pred == 0)).sum())
-    total = y_true.size
-
-    print(f"\n{'='*52}")
-    print(f"  Binary Classifier Breakdown  ({total:,} cells total)")
-    print(f"{'='*52}")
-    print(f"  True  Positive (true=1, pred=1) : {tp:>8,}  ({100*tp/total:5.1f}%)")
-    print(f"  True  Negative (true=0, pred=0) : {tn:>8,}  ({100*tn/total:5.1f}%)")
-    print(f"  False Positive (true=0, pred=1) : {fp:>8,}  ({100*fp/total:5.1f}%)")
-    print(f"  False Negative (true=1, pred=0) : {fn:>8,}  ({100*fn/total:5.1f}%)")
-    print(f"{'='*52}")
-    actual_pos = tp + fn
-    if actual_pos > 0:
-        print(f"  Recall  (TP / all true=1)       : {tp/actual_pos:.3f}")
-    if (tp + fp) > 0:
-        print(f"  Precision (TP / all pred=1)     : {tp/(tp+fp):.3f}")
-    print(f"{'='*52}")
 
     rows = []
     for i, col in enumerate(binary_cols):
@@ -344,6 +460,7 @@ def binary_zero_breakdown(binary_preds: np.ndarray, df_data: pd.DataFrame, binar
     )
     print("\nPer-side-effect breakdown (sorted by Recall ascending):")
     print(per_effect.to_string(index=False))
+
 
 
 def prr_zero_breakdown(preds: dict, df_data: pd.DataFrame, prr_cols: list):
@@ -437,6 +554,89 @@ def predict(models: dict, df: pd.DataFrame) -> dict:
         "binary":   binary_preds,
         "prr":      prr_preds,
     }
+
+
+# ── Binary Threshold Visualisation ────────────────────────────────────────────
+
+
+def plot_precision_recall_threshold(
+    models: dict,
+    X_val,
+    df_val: pd.DataFrame,
+    binary_cols: list,
+    out_path: str = "pr_threshold.png",
+):
+    """
+    Three-panel precision-recall diagnostic for one or more binary classifiers.
+
+    Panel 1 — Precision-Recall curve (micro-averaged across all side effects)
+    Panel 2 — Precision and Recall vs threshold
+    Panel 3 — Micro-F1 vs threshold, with the argmax threshold marked
+
+    ``models`` is a dict of {label: model} where each model exposes predict_proba().
+    The micro-average is computed by flattening all (n_samples × n_outputs) predictions.
+    """
+    from sklearn.metrics import precision_recall_curve, auc
+
+    y_true_flat = df_val[binary_cols].fillna(0).values.astype(int).ravel()
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Binary Classifier: Precision / Recall / F1 vs Threshold", fontsize=13, fontweight="bold")
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    for (name, model), color in zip(models.items(), colors):
+        probs_flat = get_pos_proba(model, X_val).ravel()
+        precision, recall, thresholds = precision_recall_curve(y_true_flat, probs_flat)
+        pr_auc = auc(recall, precision)
+
+        # F1 at every threshold (precision/recall are length n+1; thresholds length n)
+        f1 = np.where(
+            (precision[:-1] + recall[:-1]) > 0,
+            2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1]),
+            0.0,
+        )
+        best_idx = int(np.argmax(f1))
+        best_thresh = float(thresholds[best_idx])
+        best_f1 = float(f1[best_idx])
+
+        print(f"  [{name}] best micro-F1={best_f1:.4f} at threshold={best_thresh:.3f}")
+
+        # Panel 1: PR curve
+        axes[0].plot(recall, precision, label=f"{name} (AUC={pr_auc:.3f})", color=color)
+
+        # Panel 2: P & R vs threshold
+        axes[1].plot(thresholds, precision[:-1], color=color, label=f"{name} Precision")
+        axes[1].plot(thresholds, recall[:-1],    color=color, label=f"{name} Recall", linestyle="--")
+
+        # Panel 3: F1 vs threshold
+        axes[2].plot(thresholds, f1, color=color, label=f"{name} (best={best_f1:.3f} @ {best_thresh:.2f})")
+        axes[2].axvline(best_thresh, color=color, linestyle=":", linewidth=1)
+
+    axes[0].set_xlabel("Recall")
+    axes[0].set_ylabel("Precision")
+    axes[0].set_title("Precision-Recall Curve")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(alpha=0.3)
+
+    axes[1].axvline(0.5, color="gray", linestyle=":", linewidth=1, label="default 0.5")
+    axes[1].set_xlabel("Threshold")
+    axes[1].set_ylabel("Score")
+    axes[1].set_title("Precision & Recall vs Threshold")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(alpha=0.3)
+
+    axes[2].axvline(0.5, color="gray", linestyle=":", linewidth=1, label="default 0.5")
+    axes[2].set_xlabel("Threshold")
+    axes[2].set_ylabel("Micro-F1")
+    axes[2].set_title("F1 vs Threshold")
+    axes[2].legend(fontsize=8)
+    axes[2].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"PR threshold plot saved to: {out_path}")
 
 
 # ── PRR Visualisation ─────────────────────────────────────────────────────────
@@ -578,6 +778,14 @@ def submit(models, preds, df_test, out_path: str = SUBMISSION_PATH):
     print(f"Submission saved to: {out_path}  ({sub.shape[0]} rows, {sub.shape[1]} cols)")
     return sub
 
+def predict_and_breakdown(model, binary_cols, X_val, df_val):
+    print("\nPredicting on validation set...")
+    binary_preds = model.predict(X_val)
+    print("\nZero breakdown on validation set...")
+    binary_zero_breakdown(binary_preds, df_val, binary_cols)
+
+
+
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -618,15 +826,32 @@ if __name__ == "__main__":
     X_val, _, _              = prepare_features(df_val, tfidf_vecs=tfidf_vecs, pca=pca, fit=False)
 
     # Train binary on all rows — used for zero-gating at inference.
-    binary_model = train_binary(X_train, df_train, binary_cols)
-    print("\nPredicting PRR on validation set...")
-    binary_preds = binary_model.predict(X_val)
-    print("\nZero breakdown on validation set...")
-    binary_zero_breakdown(binary_preds, df_val, binary_cols)
-    print("\nPredicting PRR on training set...")
-    binary_preds_training = binary_model.predict(X_train)
-    print("\nZero breakdown on training set...")
-    binary_zero_breakdown(binary_preds_training, df_train, binary_cols)
+    #binary_model = train_binary_random_forest(X_train, df_train, binary_cols)
+    #binary_model = train_binary_ensemble(X_train, df_train, binary_cols, n_splits=5)
+    #binary_model = train_binary_lgbm(X_train, df_train, binary_cols)
+    print("Running Random Forest binary classifier...")
+    random_forest_model = DrugInteractionRandomForestClassifier.DrugInteractionRandomForestClassifier()
+    lgbm_model = DrugInteractionLGBMClassifier.DrugInteractionLGBMClassifier()
+    ensemble_model = BinaryEnsemble(models=[random_forest_model, lgbm_model])
+    ensemble_model.train(X_train, df_train, binary_cols)
+    print("Running Random Forest binary classifier...")
+    predict_and_breakdown(random_forest_model, binary_cols, X_val, df_val)
+    print("Running LGBM binary classifier ...")
+    predict_and_breakdown(lgbm_model, binary_cols, X_val, df_val)
+    print("Running Ensemble binary classifier ...")
+    predict_and_breakdown(ensemble_model, binary_cols, X_val, df_val)
+
+    print("\nPlotting precision-recall threshold curves...")
+    plot_precision_recall_threshold(
+        models={
+            "Random Forest":     random_forest_model,
+            "LightGBM":         lgbm_model,
+            "Ensemble (RF+LGBM)": ensemble_model,
+        },
+        X_val=X_val,
+        df_val=df_val,
+        binary_cols=binary_cols,
+    )
 
 
 
